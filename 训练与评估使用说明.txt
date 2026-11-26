@@ -1,0 +1,173 @@
+首先：如何在 Jupyter Notebook 中运行完整五折训练并查看结果
+
+在 lka_project 文件夹中打开或新建 Notebook，按顺序运行下面四个单元格。
+也可直接打开同目录的“Jupyter五折训练与结果查看.ipynb”。
+主程序默认且只支持完整五折交叉验证；无需指定第0折。
+如果只看到fold0的日志，请等待，它结束后会继续fold1至fold4。
+不要同时重复执行训练单元格。每次训练会创建新的结果目录。
+
+【单元格1：设置项目位置与Python】
+from pathlib import Path
+from datetime import datetime
+import os
+import subprocess
+import pandas as pd
+from IPython.display import display
+
+PROJECT = Path('/Users/guo/Desktop/Final project 2026/lka_project')
+PYTHON = Path('/opt/anaconda3/bin/python')
+os.chdir(PROJECT)
+assert (PROJECT / 'scripts/train_and_evaluate.py').exists()
+assert PYTHON.exists()
+print('项目目录：', PROJECT)
+print('训练使用的Python：', PYTHON)
+
+【单元格2：选择模型并设置完整五折训练参数】
+MODEL = 'dual'  # stats、tcn、dual、image、fusion、gated
+EPOCHS = 40
+BATCH_SIZE = 32  # 图像或门控模型可先用16
+LEARNING_RATE = 0.001  # 图像或门控模型可从0.0001开始验证
+WEIGHTS = None  # 使用预训练ResNet时，填写本地权重文件的绝对路径
+RUN_DIR = PROJECT / 'runs' / f'{MODEL}_cv_{datetime.now():%Y%m%d_%H%M%S_%f}'
+print('本次输出目录：', RUN_DIR)
+
+【单元格3：启动训练，实时显示日志，结束后自动评估】
+command = [str(PYTHON), '-u', 'scripts/train_and_evaluate.py',
+           '--model', MODEL, '--fold', 'all', '--epochs', str(EPOCHS),
+           '--patience', '7', '--batch-size', str(BATCH_SIZE),
+           '--lr', str(LEARNING_RATE), '--output', str(RUN_DIR)]
+if WEIGHTS:
+    command += ['--weights', str(WEIGHTS)]
+process = subprocess.Popen(command, cwd=PROJECT, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, bufsize=1)
+try:
+    for line in process.stdout:
+        print(line, end='', flush=True)
+    if process.wait() != 0:
+        raise RuntimeError('训练未正常完成，请检查上方错误。')
+except KeyboardInterrupt:
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    raise
+print('\n五折训练与评估已完成：', RUN_DIR)
+
+【单元格4：查看五折指标与合并预测的指标】
+metrics = ['accuracy', 'precision', 'recall', 'f1', 'f2',
+           'roc_auc', 'average_precision', 'pr_auc_trapezoid']
+print('各折验证指标：')
+display(pd.read_csv(RUN_DIR / 'cv_metrics.csv')[['fold'] + metrics])
+print('五折均值与标准差：')
+display(pd.read_csv(RUN_DIR / 'cv_summary.csv', index_col=0))
+print('五折验证预测合并后的整体指标：')
+display(pd.read_csv(RUN_DIR / 'pooled_validation/metrics.csv')[metrics])
+print('合并混淆矩阵（行=真实，列=预测）：')
+display(pd.read_csv(RUN_DIR / 'pooled_validation/confusion_matrix.csv', index_col=0))
+
+【可选单元格5：画出五折训练曲线】
+import matplotlib.pyplot as plt
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for fold in range(5):
+    history = pd.read_csv(RUN_DIR / f'fold{fold}/training_history.csv')
+    axes[0].plot(history['epoch'], history['train_loss_batch_weighted'], label=f'Fold {fold+1}')
+    axes[1].plot(history['epoch'], history['val_ap'], label=f'Fold {fold+1}')
+axes[0].set(xlabel='Epoch', ylabel='Training loss')
+axes[1].set(xlabel='Epoch', ylabel='Validation AP')
+for ax in axes:
+    ax.legend()
+    ax.grid(alpha=0.2)
+plt.tight_layout()
+plt.savefig(RUN_DIR / 'five_fold_training_curves.png', dpi=200)
+plt.show()
+
+所有结果均保存在RUN_DIR显示的目录，Notebook关闭后仍然存在。
+若重启内核后需要查看旧结果，重新运行单元格1，并手动设置：
+RUN_DIR = PROJECT / 'runs' / '你之前的结果文件夹名'
+然后运行单元格4、5即可，无需重新训练。
+验证指标用于模型选择，独立测试需要按后文最终重训步骤显式运行。
+上述路径适用于当前Mac；换电脑需修改PROJECT和PYTHON，并准备原始图像。
+
+------------------------------------------------------------
+以下为训练程序和评估输出的详细说明
+
+训练与性能评估代码
+
+一、入口
+scripts/train_and_evaluate.py：前半部分训练，后半部分恢复最佳权重并评估。
+src/lka/evaluation.py：统一指标计算与结果导出。
+保留原有数据、模型与分组。只读取history_eligible历史充分样本。
+
+二、运行环境
+以下命令在 lka_project 文件夹执行。
+当前机器可用 /opt/anaconda3/bin/python；其他机器安装requirements.txt后使用python。
+所有 --output 必须是尚不存在的新目录，防止覆盖实验。
+
+1. CAN双路径：完整五折训练、验证与评估
+/opt/anaconda3/bin/python scripts/train_and_evaluate.py --model dual --fold all --epochs 40 --patience 7 --batch-size 32 --lr 0.001 --output runs/dual_cv
+
+2. 可靠性门控：五折交叉验证
+/opt/anaconda3/bin/python scripts/train_and_evaluate.py --model gated --fold all --epochs 40 --patience 7 --batch-size 16 --lr 0.0001 --output runs/gated_cv
+该命令默认ResNet随机初始化。如使用预训练ResNet-18，请增加：
+--weights /绝对路径/resnet18权重文件.pth
+权重必须是与torchvision ResNet-18兼容的原始state_dict。不会自动下载。
+
+3. 其他模型
+--model 可选：stats（统计MLP）、tcn、dual、image、fusion、gated。
+所有模型使用同一分组、同一历史充分样本；XGBoost见原check_xgboost.py。
+--class-weight 根据本折训练集类别数量设置交叉熵权重。
+--device 可选auto、cpu、cuda、mps。auto优先CUDA，其次MPS，最后CPU。
+如果MPS算子或显存不适合，可指定 --device cpu；图像模型CPU训练较慢。
+
+4. 最终全训练集重训与独立测试
+先完成交叉验证并确定模型、学习率、阈值和轮数。
+summary.json给出selected_epochs及中位数suggested_refit_epochs，可作为重训轮数候选。
+例如确认训练20轮后：
+/opt/anaconda3/bin/python scripts/train_and_evaluate.py --model dual --final-epochs 20 --batch-size 32 --lr 0.001 --threshold 0.5 --output runs/dual_final
+该模式不以测试结果早停；在全训练集固定训练20轮，之后才评估独立测试集。
+train_all与test同时使用transform_train_all.npz，避免训练/测试标准化不一致。
+训练轮数20仅为命令示例，不是已验证的最优参数。
+
+三、训练方法
+交叉熵损失、AdamW、梯度裁剪；默认阈值0.5。
+每轮计算验证集Average Precision（AP），以其提升选择最佳模型并早停。
+训练结束恢复最佳权重，而不是直接评估最后一轮。
+随机种子、参数、分组manifest哈希与实际设备写入config.json。
+输出best_model.pt和对应preprocessing.npz，后续推断必须配套使用。
+当前不提供中断恢复；重新运行请选择新的输出路径。
+
+四、性能评估（异常为正类1）
+Accuracy、Precision、Recall、F1、F2、Specificity、误报率、漏检率、
+Balanced Accuracy、ROC-AUC、Average Precision、梯形积分PR-AUC、
+Log Loss、Brier Score、两类分别的precision/recall/F1/support与macro/weighted汇总。
+AP与梯形PR-AUC分别保存，不混为同一指标；单类数据的排序AUC记为null。
+混淆矩阵行是真实类别、列是预测类别：[[TN,FP],[FN,TP]]。
+
+五、输出内容
+程序依次运行fold0、fold1、fold2、fold3、fold4，共五折。fold0只是第1折的内部编号，
+不是只运行一折。下面foldK代表这五个目录中的任意一个。
+cv_metrics.csv：五折分别的指标
+cv_summary.csv：五折指标的均值与样本标准差（不是置信区间）
+foldK/config.json：实验配置和输入维度
+foldK/preprocessing.npz：本模型配套预处理参数
+foldK/best_model.pt：最佳模型参数及epoch
+foldK/training_history.csv：逐轮训练损失、验证AP/F1/Log Loss及时间
+foldK/validation/metrics.json、metrics.csv：整体指标
+foldK/validation/classification_report.csv：逐类及汇总指标
+foldK/validation/confusion_matrix.csv：混淆矩阵
+foldK/validation/predictions.csv：逐样本真实标签、概率、预测类别及关联组
+foldK/validation/roc_curve.csv、pr_curve.csv：绘图用曲线数据
+pooled_validation/：将所选折验证预测合并计算的指标（不是五折指标简单平均）
+summary.json：各折选中的轮数与建议重训轮数
+最终模式使用test/子目录保存测试指标。
+验证数据用于早停，验证分数属于模型选择结果，不能称为独立测试表现。
+
+六、当前验证状态
+已实际运行CAN双路径2轮/64样本及门控1轮/32样本的小规模端到端检查。
+这些运行位于runs/smoke_*，只验证代码链路，不能作为正式模型性能。
+另外已使用统计MLP完成五折各1轮、每折最多64样本的默认入口验证。
+完整规模五折训练、预训练权重加载和最终独立测试尚未运行。
+--limit-samples仅用于调试，会截取数据并改变类别分布，禁止用于最终测试。
+预处理既有假设仍适用：图像与CAN端点关系待确认，负误差按原题有符号均值生成标签。
